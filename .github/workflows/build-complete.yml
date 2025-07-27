@@ -154,7 +154,31 @@ jobs:
       run: |
         cd gecko-dev
         export MOZBUILD_STATE_PATH=$HOME/.mozbuild
-        python3 ./mach bootstrap --no-interactive --application-choice=mobile_android
+        
+        # 检查 mach bootstrap 支持的参数
+        echo "Checking mach bootstrap options..."
+        python3 ./mach bootstrap --help || true
+        
+        # 尝试不同的 bootstrap 方式
+        echo "Starting bootstrap process..."
+        
+        # 方法1：尝试使用 --application-choice
+        if python3 ./mach bootstrap --application-choice=mobile_android 2>/dev/null; then
+          echo "Bootstrap successful with --application-choice"
+        else
+          echo "Method 1 failed, trying alternative..."
+          
+          # 方法2：使用 yes 命令自动回答交互提示
+          echo "2" | python3 ./mach bootstrap || {
+            echo "Method 2 failed, trying manual setup..."
+            
+            # 方法3：手动安装必要的依赖
+            python3 ./mach artifact toolchain --from-build linux64-rust
+            python3 ./mach artifact toolchain --from-build linux64-cbindgen
+            python3 ./mach artifact toolchain --from-build linux64-nasm
+            python3 ./mach artifact toolchain --from-build linux64-node
+          }
+        fi
 
     - name: Build APK
       run: |
