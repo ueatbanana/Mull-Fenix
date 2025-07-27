@@ -80,10 +80,15 @@ jobs:
 
     - name: Clone Gecko source
       run: |
-        # 克隆 mozilla-central 或 esr115
+        # 推荐版本说明：
+        # esr115: 最稳定，Mull 原始支持版本
+        # esr128: 较新但仍稳定，有安全更新
+        # latest: 最新版本，构建难度高，不推荐
+        
         git clone --depth 1 --branch ${{ github.event.inputs.gecko_version }} \
           https://github.com/mozilla/gecko-dev.git gecko-dev
         cd gecko-dev
+        echo "Using Firefox version: ${{ github.event.inputs.gecko_version }}"
         git log -1 --oneline
 
     - name: Apply Mull patches (if any)
