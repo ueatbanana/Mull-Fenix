@@ -1,0 +1,227 @@
+name: Build Mull-Fenix Complete
+
+on:
+  workflow_dispatch:
+    inputs:
+      gecko_version:
+        description: 'Gecko ESR version (default: esr115)'
+        required: false
+        default: 'esr115'
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 480  # 8小时超时，构建可能很长
+
+    steps:
+    - name: Maximize build space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        df -h
+
+    - name: Checkout Mull-Fenix
+      uses: actions/checkout@v4
+      with:
+        path: mull-fenix
+
+    - name: Setup build environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          curl wget unzip zip git \
+          clang cmake ninja-build pkg-config \
+          libgtk-3-dev libdbus-glib-1-dev libxt-dev libx11-dev \
+          autoconf2.13 python3 python-is-python3 \
+          build-essential libc6-dev \
+          yasm nasm nodejs npm \
+          mercurial
+
+    - name: Set up Java 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+
+    - name: Set up Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: stable
+        target: aarch64-linux-android
+
+    - name: Install Android SDK and NDK
+      run: |
+        # 下载并安装 Android SDK
+        wget -q https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip
+        unzip -q commandlinetools-linux-9477386_latest.zip
+        mkdir -p /opt/android-sdk/cmdline-tools
+        mv cmdline-tools /opt/android-sdk/cmdline-tools/latest
+        
+        export ANDROID_HOME=/opt/android-sdk
+        export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin
+        
+        # 安装必要的 SDK 组件
+        yes | sdkmanager --licenses
+        sdkmanager "platforms;android-33" "build-tools;33.0.2"
+        
+        # 下载并安装 NDK r25c (与 ESR115 兼容)
+        wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+        unzip -q android-ndk-r25c-linux.zip
+        mv android-ndk-r25c /opt/android-ndk
+        
+        echo "ANDROID_HOME=/opt/android-sdk" >> $GITHUB_ENV
+        echo "ANDROID_SDK_ROOT=/opt/android-sdk" >> $GITHUB_ENV
+        echo "ANDROID_NDK_HOME=/opt/android-ndk" >> $GITHUB_ENV
+        echo "/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-ndk" >> $GITHUB_PATH
+
+    - name: Clone Gecko source
+      run: |
+        # 克隆 mozilla-central 或 esr115
+        git clone --depth 1 --branch ${{ github.event.inputs.gecko_version }} \
+          https://github.com/mozilla/gecko-dev.git gecko-dev
+        cd gecko-dev
+        git log -1 --oneline
+
+    - name: Apply Mull patches (if any)
+      run: |
+        cd gecko-dev
+        # 如果 mull-fenix 有补丁文件，应用它们
+        if [ -d "../mull-fenix/patches" ]; then
+          for patch in ../mull-fenix/patches/*.patch; do
+            if [ -f "$patch" ]; then
+              echo "Applying patch: $patch"
+              git apply "$patch" || echo "Patch $patch failed, continuing..."
+            fi
+          done
+        fi
+
+    - name: Create mozconfig
+      run: |
+        cd gecko-dev
+        cat > mozconfig << 'EOF'
+        # Target
+        ac_add_options --target=aarch64-linux-android
+        ac_add_options --enable-application=mobile/android
+
+        # Android SDK/NDK
+        ac_add_options --with-android-sdk=/opt/android-sdk
+        ac_add_options --with-android-ndk=/opt/android-ndk
+
+        # Build options
+        ac_add_options --enable-release
+        ac_add_options --enable-optimize
+        ac_add_options --disable-debug
+        ac_add_options --disable-tests
+        ac_add_options --disable-necko-wifi
+        ac_add_options --disable-updater
+        ac_add_options --disable-crashreporter
+        ac_add_options --disable-maintenance-service
+
+        # Branding (使用 Mull 品牌)
+        ac_add_options --with-branding=mobile/android/branding/mull
+        ac_add_options --enable-official-branding
+
+        # 性能优化
+        ac_add_options --enable-lto=thin
+        EOF
+
+    - name: Setup Mull branding
+      run: |
+        cd gecko-dev
+        # 创建 Mull branding 目录结构
+        mkdir -p mobile/android/branding/mull
+        
+        # 复制并修改品牌文件（如果 mull-fenix 提供了的话）
+        if [ -d "../mull-fenix/branding" ]; then
+          cp -r ../mull-fenix/branding/* mobile/android/branding/mull/
+        else
+          # 使用默认的 Firefox branding 作为基础
+          cp -r mobile/android/branding/unofficial/* mobile/android/branding/mull/
+          # 修改应用名称
+          sed -i 's/Fennec/Mull/g' mobile/android/branding/mull/configure.sh
+        fi
+
+    - name: Bootstrap build environment
+      run: |
+        cd gecko-dev
+        export MOZBUILD_STATE_PATH=$HOME/.mozbuild
+        python3 ./mach bootstrap --no-interactive --application-choice=mobile_android
+
+    - name: Build APK
+      run: |
+        cd gecko-dev
+        export MOZBUILD_STATE_PATH=$HOME/.mozbuild
+        export MOZCONFIG=$PWD/mozconfig
+        
+        # 构建
+        ./mach build
+        ./mach package
+
+    - name: Find and prepare APK
+      id: find_apk
+      run: |
+        cd gecko-dev
+        APK_PATH=$(find obj-* -name "*.apk" -type f | head -n1)
+        if [ -z "$APK_PATH" ]; then
+          echo "No APK found!"
+          exit 1
+        fi
+        
+        echo "Found APK: $APK_PATH"
+        
+        # 复制到工作目录并重命名
+        cp "$APK_PATH" ../mull-fenix-arm64-$(date +%Y%m%d).apk
+        echo "apk_name=mull-fenix-arm64-$(date +%Y%m%d).apk" >> $GITHUB_OUTPUT
+
+    - name: Decode signing keystore
+      if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+      run: |
+        mkdir -p keystore
+        echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > keystore/keystore.jks
+
+    - name: Sign APK
+      if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+      run: |
+        APK_NAME="${{ steps.find_apk.outputs.apk_name }}"
+        
+        # 对齐APK
+        /opt/android-sdk/build-tools/33.0.2/zipalign -v 4 "$APK_NAME" "${APK_NAME%.apk}-aligned.apk"
+        
+        # 签名APK
+        jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 \
+          -keystore keystore/keystore.jks \
+          -storepass "${{ secrets.KEYSTORE_PASSWORD }}" \
+          -keypass "${{ secrets.KEY_PASSWORD }}" \
+          "${APK_NAME%.apk}-aligned.apk" "${{ secrets.KEY_ALIAS }}"
+        
+        # 最终签名验证
+        jarsigner -verify -verbose "${APK_NAME%.apk}-aligned.apk"
+        
+        mv "${APK_NAME%.apk}-aligned.apk" "${APK_NAME%.apk}-signed.apk"
+
+    - name: Upload unsigned APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: mull-fenix-unsigned-apk
+        path: "*.apk"
+        retention-days: 30
+
+    - name: Upload signed APK
+      if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: mull-fenix-signed-apk
+        path: "*-signed.apk"
+        retention-days: 90
+
+    - name: Build summary
+      run: |
+        echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- Gecko version: ${{ github.event.inputs.gecko_version }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Target: arm64-v8a" >> $GITHUB_STEP_SUMMARY
+        echo "- APK name: ${{ steps.find_apk.outputs.apk_name }}" >> $GITHUB_STEP_SUMMARY
+        ls -la *.apk >> $GITHUB_STEP_SUMMARY || echo "No APK files found" >> $GITHUB_STEP_SUMMARY
