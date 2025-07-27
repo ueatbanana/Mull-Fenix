@@ -112,27 +112,37 @@ jobs:
         ac_add_options --target=aarch64-linux-android
         ac_add_options --enable-application=mobile/android
 
-        # Android SDK/NDK
+        # Android SDK/NDK paths  
         ac_add_options --with-android-sdk=/opt/android-sdk
         ac_add_options --with-android-ndk=/opt/android-ndk
+        
+        # Android API 设置
+        ac_add_options --with-android-min-sdk=21
+        ac_add_options --with-android-max-sdk=33
 
-        # Build options
+        # Build type
         ac_add_options --enable-release
-        ac_add_options --enable-optimize
         ac_add_options --disable-debug
         ac_add_options --disable-tests
+        
+        # 减少构建复杂度
         ac_add_options --disable-necko-wifi
         ac_add_options --disable-updater
         ac_add_options --disable-crashreporter
         ac_add_options --disable-maintenance-service
-
-        # Branding (使用 Mull 品牌)
-        ac_add_options --with-branding=mobile/android/branding/mull
-        ac_add_options --enable-official-branding
-
-        # 性能优化
-        ac_add_options --enable-lto=thin
+        ac_add_options --disable-webrtc
+        ac_add_options --disable-webspeech
+        
+        # 内存优化
+        ac_add_options --enable-linker=lld
+        mk_add_options MOZ_MAKE_FLAGS="-j2"
+        
+        # 使用系统默认 branding（避免 Mull branding 问题）
+        ac_add_options --with-branding=mobile/android/branding/unofficial
         EOF
+        
+        echo "Generated mozconfig:"
+        cat mozconfig
 
     - name: Setup Mull branding
       run: |
@@ -186,9 +196,43 @@ jobs:
         export MOZBUILD_STATE_PATH=$HOME/.mozbuild
         export MOZCONFIG=$PWD/mozconfig
         
-        # 构建
-        ./mach build
-        ./mach package
+        echo "=== Starting Firefox build process ==="
+        echo "Build configuration:"
+        cat mozconfig
+        
+        echo "=== Checking environment ==="
+        echo "Android SDK: $ANDROID_HOME"
+        echo "Android NDK: $ANDROID_NDK_HOME"
+        ls -la /opt/android-ndk/ || echo "NDK directory issue"
+        ls -la /opt/android-sdk/ || echo "SDK directory issue"
+        
+        echo "=== Configure step ==="
+        ./mach configure || {
+          echo "Configure failed, checking logs..."
+          find . -name "config.log" -exec tail -50 {} \;
+          exit 1
+        }
+        
+        echo "=== Build step ==="
+        # 使用更低的并发来避免内存问题
+        ./mach build -j2 || {
+          echo "Build failed, showing recent log entries..."
+          find . -name "*.log" -newer mozconfig -exec tail -100 {} \;
+          echo "Checking for common error patterns..."
+          find . -name "*.log" -exec grep -l "error\|Error\|ERROR" {} \; | head -5 | xargs tail -50
+          exit 1
+        }
+        
+        echo "=== Package step ==="
+        ./mach package || {
+          echo "Package failed, checking output directory..."
+          find obj-* -type f -name "*.apk" 2>/dev/null || echo "No APK found"
+          find obj-* -type f -name "*.so" 2>/dev/null | head -10 || echo "No shared libraries found"
+          exit 1
+        }
+        
+        echo "=== Build completed successfully ==="
+        find obj-* -name "*.apk" -ls
 
     - name: Find and prepare APK
       id: find_apk
