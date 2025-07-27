@@ -57,7 +57,7 @@ jobs:
           "$APK" "${{ secrets.KEY_ALIAS }}"
 
     - name: Upload signed APK
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: signed-mull-apk
         path: |
