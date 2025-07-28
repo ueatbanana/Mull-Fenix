@@ -45,13 +45,51 @@ jobs:
           openjdk-17-jdk-headless \
           build-essential \
           rsync \
-          unzip
+          unzip \
+          android-sdk-build-tools-common \
+          apksigner
 
-    - name: Set up Java 17
-      uses: actions/setup-java@v4
-      with:
-        distribution: 'temurin'
-        java-version: '17'
+    - name: Install and setup Android SDK
+      run: |
+        # 下载并安装 Android SDK
+        mkdir -p /opt/android-sdk
+        cd /opt/android-sdk
+        
+        # 下载 command line tools
+        wget -q https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip
+        unzip -q commandlinetools-linux-9477386_latest.zip
+        mkdir -p cmdline-tools
+        mv cmdline-tools cmdline-tools/latest
+        
+        # 设置环境变量
+        export ANDROID_HOME=/opt/android-sdk
+        export ANDROID_SDK_ROOT=/opt/android-sdk
+        export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin
+        
+        # 接受许可证
+        yes | sdkmanager --licenses || true
+        
+        # 安装必要组件
+        sdkmanager "platforms;android-33" "build-tools;33.0.2" "platforms;android-21"
+        
+        # 下载 NDK
+        wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+        unzip -q android-ndk-r25c-linux.zip
+        mv android-ndk-r25c ndk
+        
+        # 验证安装
+        echo "=== Android SDK verification ==="
+        ls -la /opt/android-sdk/
+        ls -la /opt/android-sdk/build-tools/
+        
+        # 确保权限正确
+        sudo chown -R runner:runner /opt/android-sdk
+        
+        # 设置全局环境变量
+        echo "ANDROID_HOME=/opt/android-sdk" >> $GITHUB_ENV
+        echo "ANDROID_SDK_ROOT=/opt/android-sdk" >> $GITHUB_ENV
+        echo "/opt/android-sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
+        echo "/opt/android-sdk/build-tools/33.0.2" >> $GITHUB_PATH
 
     - name: Install fdroidserver
       run: |
@@ -60,42 +98,73 @@ jobs:
         pip install fdroidserver
         fdroid --version
 
+    - name: Set up Java 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+
     - name: Setup fdroid environment
       run: |
         source fdroid-env/bin/activate
         mkdir -p fdroid-build
         cd fdroid-build
-        echo "=== Initializing fdroid repository ==="
-        fdroid init --verbose
-        echo "=== Using configuration from Mull-Fenix repository ==="
-        echo "Official config file path: ../Mull-Fenix/-fdroiddata/metadata/us.spotco.fennec_dos.yml"
+        
+        # 预配置 fdroid 配置文件，避免交互式输入
+        cat > config.yml << 'EOF'
+sdk_path: /opt/android-sdk
+ndk_paths:
+  r25c: /opt/android-sdk/ndk
+build_tools: 33.0.2
+keystore: debug.keystore
+repo_keyalias: sova
+keypass: android
+keystorepass: android
+keydname: CN=Birdman, OU=Cell, O=Alcatraz, L=Alcatraz, S=California, C=US
+EOF
+        
+        echo "=== Initializing fdroid repository with config ==="
+        fdroid init --verbose || {
+          echo "Init failed, checking Android SDK setup..."
+          echo "ANDROID_HOME: $ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT: $ANDROID_SDK_ROOT"
+          ls -la /opt/android-sdk/ || echo "SDK not found"
+          which apksigner || echo "apksigner not found"
+          exit 1
+        }
+        
+        echo "=== Fdroid repository initialized successfully ==="
 
     - name: Get version information from config
       id: version_info
       run: |
         echo "=== Extracting version info from official config ==="
-        if [ -f "Mull-Fenix/-fdroiddata/metadata/us.spotco.fennec_dos.yml" ]; then
-          CURRENT_VERSION=$(grep "CurrentVersion:" Mull-Fenix/-fdroiddata/metadata/us.spotco.fennec_dos.yml | cut -d"'" -f2)
-          CURRENT_VERSION_CODE=$(grep "CurrentVersionCode:" Mull-Fenix/-fdroiddata/metadata/us.spotco.fennec_dos.yml | awk '{print $2}')
-          
-          echo "Official current version: $CURRENT_VERSION"
-          echo "Official current version code: $CURRENT_VERSION_CODE"
-          echo "User requested version code: ${{ github.event.inputs.version_code }}"
-          
-          if [ "${{ github.event.inputs.version_code }}" = "auto" ]; then
-            VERSION_TO_BUILD="$CURRENT_VERSION_CODE"
-            echo "Using official version code: $VERSION_TO_BUILD"
-          else
-            VERSION_TO_BUILD="${{ github.event.inputs.version_code }}"
-            echo "Using user specified version code: $VERSION_TO_BUILD"
-          fi
-          
-          echo "version_to_build=$VERSION_TO_BUILD" >> $GITHUB_OUTPUT
-          echo "official_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
-        else
-          echo "Official config file not found!"
+        
+        # 检查配置文件是否存在
+        if [ ! -f "-fdroiddata/metadata/us.spotco.fennec_dos.yml" ]; then
+          echo "ERROR: Official config file not found!"
+          echo "Looking for config files..."
+          find . -name "*.yml" | head -10
           exit 1
         fi
+        
+        CURRENT_VERSION=$(grep "CurrentVersion:" -fdroiddata/metadata/us.spotco.fennec_dos.yml | cut -d"'" -f2)
+        CURRENT_VERSION_CODE=$(grep "CurrentVersionCode:" -fdroiddata/metadata/us.spotco.fennec_dos.yml | awk '{print $2}')
+        
+        echo "Official current version: $CURRENT_VERSION"
+        echo "Official current version code: $CURRENT_VERSION_CODE"
+        echo "User requested version code: ${{ github.event.inputs.version_code }}"
+        
+        if [ "${{ github.event.inputs.version_code }}" = "auto" ]; then
+          VERSION_TO_BUILD="$CURRENT_VERSION_CODE"
+          echo "Using official version code: $VERSION_TO_BUILD"
+        else
+          VERSION_TO_BUILD="${{ github.event.inputs.version_code }}"
+          echo "Using user specified version code: $VERSION_TO_BUILD"
+        fi
+        
+        echo "version_to_build=$VERSION_TO_BUILD" >> $GITHUB_OUTPUT
+        echo "official_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
 
     - name: Prepare Mull build configuration
       run: |
@@ -103,17 +172,19 @@ jobs:
         cd fdroid-build
         
         echo "=== Using official Mull configuration from repository ==="
-        cp ../Mull-Fenix/-fdroiddata/metadata/us.spotco.fennec_dos.yml metadata/
+        cp ../-fdroiddata/metadata/us.spotco.fennec_dos.yml metadata/
         
         echo "=== Official Mull configuration content ==="
         cat metadata/us.spotco.fennec_dos.yml
         
         echo "=== Checking for additional fdroiddata files ==="
-        find ../Mull-Fenix/-fdroiddata/ -type f | head -20
+        find ../-fdroiddata/ -type f | head -20
         
-        if [ -d "../Mull-Fenix/-fdroiddata/" ]; then
+        if [ -d "../-fdroiddata/" ]; then
           echo "=== Copying all fdroiddata configuration ==="
-          cp -r ../Mull-Fenix/-fdroiddata/* ./ 2>/dev/null || true
+          # 只复制需要的文件，避免覆盖 fdroid 的配置
+          [ -d "../-fdroiddata/metadata" ] && cp -r ../-fdroiddata/metadata/* metadata/ 2>/dev/null || true
+          [ -d "../-fdroiddata/srclibs" ] && cp -r ../-fdroiddata/srclibs . 2>/dev/null || true
           
           echo "=== Copied fdroiddata structure ==="
           find . -name "*spotco*" -o -name "*fennec*" -o -name "*mull*" | head -10
