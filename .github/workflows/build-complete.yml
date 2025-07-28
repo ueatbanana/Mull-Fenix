@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version_code:
-        description: 'Version code to build (e.g., 2291052 for arm64)'
-        required: true
-        default: '2291052'
+        description: 'Version code to build (leave default for official latest: Mull 133.0.3)'
+        required: false
+        default: 'auto'
         type: string
       architecture:
         description: 'Target architecture'
@@ -73,74 +73,64 @@ jobs:
         echo "=== Initializing fdroid repository ==="
         fdroid init --verbose
         
-        echo "=== Cloning fdroiddata for Mull configs ==="
-        git clone https://gitlab.com/fdroid/fdroiddata.git
-        
-        # 查找 Mull 相关的配置文件
-        echo "=== Looking for Mull configuration ==="
-        find fdroiddata -name "*fennec*" -o -name "*mull*" -o -name "*spotco*" | head -10
+        # 我们不需要克隆 fdroiddata，因为仓库已经包含了配置
+        echo "=== Using configuration from Mull-Fenix repository ==="
+        echo "Official config file path: ../Mull-Fenix/-fdroiddata/metadata/us.spotco.fennec_dos.yml"
 
-    - name: Prepare Mull build configuration
+    - name: Get version information from config
+      id: version_info
+      run: |
+        echo "=== Extracting version info from official config ==="
+        
+        # 从官方配置文件中提取最新版本信息
+        if [ -f "Mull-Fenix/-fdroiddata/metadata/us.spotco.fennec_dos.yml" ]; then
+          CURRENT_VERSION=$(grep "CurrentVersion:" Mull-Fenix/-fdroiddata/metadata/us.spotco.fennec_dos.yml | cut -d"'" -f2)
+          CURRENT_VERSION_CODE=$(grep "CurrentVersionCode:" Mull-Fenix/-fdroiddata/metadata/us.spotco.fennec_dos.yml | awk '{print $2}')
+          
+          echo "Official current version: $CURRENT_VERSION"
+          echo "Official current version code: $CURRENT_VERSION_CODE"
+          echo "User requested version code: ${{ github.event.inputs.version_code }}"
+          
+          # 如果用户没有指定版本号，使用官方配置中的最新版本
+          if [ "${{ github.event.inputs.version_code }}" = "auto" ]; then
+            VERSION_TO_BUILD="$CURRENT_VERSION_CODE"
+            echo "Using official version code: $VERSION_TO_BUILD"
+          else
+            VERSION_TO_BUILD="${{ github.event.inputs.version_code }}"
+            echo "Using user specified version code: $VERSION_TO_BUILD"
+      - name: Prepare Mull build configuration
+      run: |
+          
+          echo "version_to_build=$VERSION_TO_BUILD" >> $GITHUB_OUTPUT
+          echo "official_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+        else
+          echo "Official config file not found!"
+          exit 1
+        fi
       run: |
         source fdroid-env/bin/activate
         cd fdroid-build
         
-        # 查找正确的应用 ID 和配置
-        echo "=== Searching for Mull app configuration ==="
-        find fdroiddata -name "*.yml" -exec grep -l "spotco\|fennec_dos\|Mull" {} \;
+        echo "=== Using official Mull configuration from repository ==="
         
-        # 复制 Mull 配置到 fdroid metadata
-        MULL_CONFIG=$(find fdroiddata -name "*.yml" -exec grep -l "us.spotco.fennec_dos\|Mull" {} \; | head -1)
-        if [ -n "$MULL_CONFIG" ]; then
-          echo "Found Mull config: $MULL_CONFIG"
-          cp "$MULL_CONFIG" metadata/
+        # 直接复制仓库中的官方配置文件
+        cp ../Mull-Fenix/-fdroiddata/metadata/us.spotco.fennec_dos.yml metadata/
+        
+        echo "=== Official Mull configuration content ==="
+        cat metadata/us.spotco.fennec_dos.yml
+        
+        # 检查是否还有其他相关配置文件
+        echo "=== Checking for additional fdroiddata files ==="
+        find ../Mull-Fenix/-fdroiddata/ -type f | head -20
+        
+        # 复制所有 fdroiddata 内容
+        if [ -d "../Mull-Fenix/-fdroiddata/" ]; then
+          echo "=== Copying all fdroiddata configuration ==="
+          cp -r ../Mull-Fenix/-fdroiddata/* ./ 2>/dev/null || true
           
-          # 显示配置内容
-          echo "=== Mull build configuration ==="
-          cat "$MULL_CONFIG"
-        else
-          echo "Mull config not found in fdroiddata, creating basic config..."
-          
-          # 创建基本的 Mull 配置
-          cat > metadata/us.spotco.fennec_dos.yml << 'EOF'
-Categories:
-  - Internet
-License: MPL-2.0
-AuthorName: Divested Computing Group
-AuthorWebSite: https://divestos.org
-WebSite: https://divestos.org/pages/our_apps#mull
-SourceCode: https://codeberg.org/divested-mobile/mull-fenix
-IssueTracker: https://codeberg.org/divested-mobile/mull-fenix/issues
-
-AutoName: Mull
-Summary: Privacy oriented web browser
-Description: |-
-    Privacy oriented web browser based on Firefox. Removes proprietary blobs and enables many features from Tor Uplift project.
-
-RepoType: git
-Repo: https://codeberg.org/divested-mobile/mull-fenix.git
-
-Builds:
-  - versionName: '129.0'
-    versionCode: ${{ github.event.inputs.version_code }}
-    commit: HEAD
-    timeout: 21600
-    sudo:
-      - apt-get update
-      - apt-get install -y mercurial
-    gradle:
-      - yes
-    prebuild: |
-      # Mull specific prebuild steps would go here
-    build: |
-      # Custom build script for Mull
-      echo "Building Mull with fdroidserver"
-
-AutoUpdateMode: None
-UpdateCheckMode: None
-CurrentVersion: '129.0'
-CurrentVersionCode: ${{ github.event.inputs.version_code }}
-EOF
+          # 显示复制的结构
+          echo "=== Copied fdroiddata structure ==="
+          find . -name "*spotco*" -o -name "*fennec*" -o -name "*mull*" | head -10
         fi
 
     - name: Build Mull APK
@@ -149,16 +139,24 @@ EOF
         cd fdroid-build
         
         echo "=== Starting fdroid build process ==="
-        echo "Version code: ${{ github.event.inputs.version_code }}"
+        echo "Using official Mull 133.0.3 configuration"
+        echo "Version code to build: ${{ steps.version_info.outputs.version_to_build }}"
+        echo "Official version: ${{ steps.version_info.outputs.official_version }}"
         echo "Architecture: ${{ github.event.inputs.architecture }}"
         
-        # 构建 Mull
-        fdroid build -v -l us.spotco.fennec_dos:${{ github.event.inputs.version_code }} || {
+        # 构建 Mull（使用从配置文件提取的版本号）
+        fdroid build -v -l us.spotco.fennec_dos:${{ steps.version_info.outputs.version_to_build }} || {
           echo "=== Build failed, checking logs ==="
           find . -name "*.log" -newer metadata -exec echo "=== {} ===" \; -exec tail -100 {} \;
           
-          echo "=== Checking build directory ==="
-          find . -name "*mull*" -o -name "*fennec*" -o -name "*.apk"
+          echo "=== Checking tmp build directory ==="
+          find tmp -name "*mull*" -o -name "*fennec*" -o -name "*.apk" 2>/dev/null | head -10
+          
+          echo "=== Checking unsigned directory ==="
+          find unsigned -name "*.apk" 2>/dev/null | head -10
+          
+          echo "=== Complete directory structure ==="
+          find . -name "*.apk" -o -name "*.jar" 2>/dev/null
           exit 1
         }
 
