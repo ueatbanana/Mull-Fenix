@@ -65,17 +65,24 @@ jobs:
         export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin
         
         # 安装必要的 SDK 组件
-        yes | sdkmanager --licenses
-        sdkmanager "platforms;android-33" "build-tools;33.0.2"
+        yes | sdkmanager --licenses || true
+        sdkmanager "platforms;android-33" "build-tools;33.0.2" "platforms;android-21"
         
         # 下载并安装 NDK r25c (与 ESR115 兼容)
         wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
         unzip -q android-ndk-r25c-linux.zip
         mv android-ndk-r25c /opt/android-ndk
         
+        # 验证安装
+        echo "=== Android SDK/NDK verification ==="
+        ls -la /opt/android-sdk/
+        ls -la /opt/android-ndk/
+        
+        # 设置环境变量
         echo "ANDROID_HOME=/opt/android-sdk" >> $GITHUB_ENV
         echo "ANDROID_SDK_ROOT=/opt/android-sdk" >> $GITHUB_ENV
         echo "ANDROID_NDK_HOME=/opt/android-ndk" >> $GITHUB_ENV
+        echo "ANDROID_NDK_ROOT=/opt/android-ndk" >> $GITHUB_ENV
         echo "/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-ndk" >> $GITHUB_PATH
 
     - name: Clone Gecko source
@@ -107,42 +114,60 @@ jobs:
     - name: Create mozconfig
       run: |
         cd gecko-dev
+        
+        # 确保环境变量正确设置
+        export ANDROID_NDK_HOME=/opt/android-ndk
+        export ANDROID_SDK_ROOT=/opt/android-sdk
+        
         cat > mozconfig << 'EOF'
-        # Target
+        # 明确指定 Android 交叉编译
         ac_add_options --target=aarch64-linux-android
         ac_add_options --enable-application=mobile/android
-
-        # Android SDK/NDK paths  
-        ac_add_options --with-android-sdk=/opt/android-sdk
-        ac_add_options --with-android-ndk=/opt/android-ndk
         
-        # Android API 设置
+        # Android 工具链路径（使用绝对路径）
+        ac_add_options --with-android-ndk=/opt/android-ndk
+        ac_add_options --with-android-sdk=/opt/android-sdk
+        
+        # Android 版本设置
         ac_add_options --with-android-min-sdk=21
         ac_add_options --with-android-max-sdk=33
-
-        # Build type
+        
+        # 构建类型和优化
         ac_add_options --enable-release
         ac_add_options --disable-debug
-        ac_add_options --disable-tests
+        ac_add_options --enable-optimize="-O2"
         
-        # 减少构建复杂度
+        # 禁用不需要的功能以简化构建
+        ac_add_options --disable-tests
         ac_add_options --disable-necko-wifi
         ac_add_options --disable-updater
-        ac_add_options --disable-crashreporter
+        ac_add_options --disable-crashreporter  
         ac_add_options --disable-maintenance-service
         ac_add_options --disable-webrtc
         ac_add_options --disable-webspeech
+        ac_add_options --disable-synth-speechd
         
-        # 内存优化
+        # 链接器设置
         ac_add_options --enable-linker=lld
-        mk_add_options MOZ_MAKE_FLAGS="-j2"
         
-        # 使用系统默认 branding（避免 Mull branding 问题）
+        # 并发控制
+        mk_add_options MOZ_MAKE_FLAGS="-j2"
+        mk_add_options MOZ_PARALLEL_BUILD=2
+        
+        # 使用默认 branding（避免自定义 branding 问题）
         ac_add_options --with-branding=mobile/android/branding/unofficial
+        
+        # 禁用官方 branding 检查
+        ac_add_options --disable-official-branding
         EOF
         
-        echo "Generated mozconfig:"
+        echo "=== Generated mozconfig ==="
         cat mozconfig
+        
+        echo "=== Environment check ==="
+        echo "ANDROID_NDK_HOME: $ANDROID_NDK_HOME"
+        echo "ANDROID_SDK_ROOT: $ANDROID_SDK_ROOT"
+        ls -la /opt/android-ndk/toolchains/ || echo "NDK toolchains not found"
 
     - name: Setup Mull branding
       run: |
@@ -195,39 +220,56 @@ jobs:
         cd gecko-dev
         export MOZBUILD_STATE_PATH=$HOME/.mozbuild
         export MOZCONFIG=$PWD/mozconfig
+        export ANDROID_NDK_HOME=/opt/android-ndk
+        export ANDROID_SDK_ROOT=/opt/android-sdk
+        export ANDROID_HOME=/opt/android-sdk
         
-        echo "=== Starting Firefox build process ==="
-        echo "Build configuration:"
-        cat mozconfig
+        echo "=== Environment Setup ==="
+        echo "MOZCONFIG: $MOZCONFIG"
+        echo "ANDROID_NDK_HOME: $ANDROID_NDK_HOME"
+        echo "ANDROID_SDK_ROOT: $ANDROID_SDK_ROOT"
         
-        echo "=== Checking environment ==="
-        echo "Android SDK: $ANDROID_HOME"
-        echo "Android NDK: $ANDROID_NDK_HOME"
-        ls -la /opt/android-ndk/ || echo "NDK directory issue"
-        ls -la /opt/android-sdk/ || echo "SDK directory issue"
+        echo "=== Verifying Android toolchain ==="
+        if [ ! -d "/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64" ]; then
+          echo "ERROR: Android NDK toolchain not found!"
+          ls -la /opt/android-ndk/
+          exit 1
+        fi
         
         echo "=== Configure step ==="
-        ./mach configure || {
-          echo "Configure failed, checking logs..."
-          find . -name "config.log" -exec tail -50 {} \;
+        ./mach configure --verbose || {
+          echo "=== Configure failed, showing logs ==="
+          if [ -f "config.log" ]; then
+            echo "--- config.log (last 100 lines) ---"
+            tail -100 config.log
+          fi
+          if [ -f "obj-*/config.log" ]; then
+            echo "--- obj-*/config.log (last 100 lines) ---"
+            tail -100 obj-*/config.log
+          fi
+          echo "=== Checking for configure errors ==="
+          find . -name "*.log" -exec grep -l "configure.*error\|configure.*failed" {} \;
           exit 1
         }
         
-        echo "=== Build step ==="
-        # 使用更低的并发来避免内存问题
-        ./mach build -j2 || {
-          echo "Build failed, showing recent log entries..."
-          find . -name "*.log" -newer mozconfig -exec tail -100 {} \;
-          echo "Checking for common error patterns..."
-          find . -name "*.log" -exec grep -l "error\|Error\|ERROR" {} \; | head -5 | xargs tail -50
+        echo "=== Configuration successful, starting build ==="
+        ./mach build -v || {
+          echo "=== Build failed, diagnostic information ==="
+          echo "--- Recent build logs ---"
+          find . -name "*.log" -newer mozconfig -exec echo "=== {} ===" \; -exec tail -50 {} \; 2>/dev/null | head -200
+          
+          echo "--- Checking for specific errors ---"
+          find . -name "*.log" -exec grep -H -A5 -B5 "error\|Error\|ERROR\|failed\|FAILED" {} \; 2>/dev/null | head -100
+          
+          echo "--- Build directory structure ---"
+          find obj-* -maxdepth 2 -type d 2>/dev/null | head -20
           exit 1
         }
         
-        echo "=== Package step ==="
+        echo "=== Build successful, creating package ==="
         ./mach package || {
-          echo "Package failed, checking output directory..."
-          find obj-* -type f -name "*.apk" 2>/dev/null || echo "No APK found"
-          find obj-* -type f -name "*.so" 2>/dev/null | head -10 || echo "No shared libraries found"
+          echo "=== Package failed ==="
+          find obj-* -name "*.apk" -o -name "*.so" -o -name "*.jar" 2>/dev/null | head -10
           exit 1
         }
         
