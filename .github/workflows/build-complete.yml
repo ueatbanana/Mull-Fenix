@@ -1,0 +1,299 @@
+name: Build Mull using FDroidServer
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_code:
+        description: 'Version code to build (leave default for official latest: Mull 133.0.3)'
+        required: false
+        default: 'auto'
+        type: string
+      architecture:
+        description: 'Target architecture'
+        required: false
+        default: 'arm64'
+        type: choice
+        options:
+        - arm64
+        - armv7
+        - x86
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+    - name: Maximize build space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        df -h
+
+    - name: Checkout Mull-Fenix
+      uses: actions/checkout@v4
+
+    - name: Setup build environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          python3 python3-pip python3-venv \
+          git mercurial subversion \
+          openjdk-17-jdk-headless \
+          build-essential \
+          rsync \
+          unzip \
+          android-sdk-build-tools-common \
+          apksigner
+
+    - name: Install and setup Android SDK
+      run: |
+        # 下载并安装 Android SDK
+        mkdir -p /opt/android-sdk
+        cd /opt/android-sdk
+        
+        # 下载 command line tools
+        wget -q https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip
+        unzip -q commandlinetools-linux-9477386_latest.zip
+        mkdir -p cmdline-tools
+        mv cmdline-tools cmdline-tools/latest
+        
+        # 设置环境变量
+        export ANDROID_HOME=/opt/android-sdk
+        export ANDROID_SDK_ROOT=/opt/android-sdk
+        export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin
+        
+        # 接受许可证
+        yes | sdkmanager --licenses || true
+        
+        # 安装必要组件
+        sdkmanager "platforms;android-33" "build-tools;33.0.2" "platforms;android-21"
+        
+        # 下载 NDK
+        wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+        unzip -q android-ndk-r25c-linux.zip
+        mv android-ndk-r25c ndk
+        
+        # 验证安装
+        echo "=== Android SDK verification ==="
+        ls -la /opt/android-sdk/
+        ls -la /opt/android-sdk/build-tools/
+        
+        # 确保权限正确
+        sudo chown -R runner:runner /opt/android-sdk
+        
+        # 设置全局环境变量
+        echo "ANDROID_HOME=/opt/android-sdk" >> $GITHUB_ENV
+        echo "ANDROID_SDK_ROOT=/opt/android-sdk" >> $GITHUB_ENV
+        echo "/opt/android-sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
+        echo "/opt/android-sdk/build-tools/33.0.2" >> $GITHUB_PATH
+
+    - name: Install fdroidserver
+      run: |
+        python3 -m venv fdroid-env
+        source fdroid-env/bin/activate
+        pip install fdroidserver
+        fdroid --version
+
+    - name: Set up Java 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+
+    - name: Setup fdroid environment
+      run: |
+        source fdroid-env/bin/activate
+        mkdir -p fdroid-build
+        cd fdroid-build
+        
+        # 预配置 fdroid 配置文件，避免交互式输入
+        cat > config.yml << 'EOF'
+        sdk_path: /opt/android-sdk
+        ndk_paths:
+          r25c: /opt/android-sdk/ndk
+        build_tools: 33.0.2
+        keystore: debug.keystore
+        repo_keyalias: sova
+        keypass: android
+        keystorepass: android
+        keydname: CN=Birdman, OU=Cell, O=Alcatraz, L=Alcatraz, S=California, C=US
+        EOF
+        
+        echo "=== Initializing fdroid repository with config ==="
+        fdroid init --verbose || {
+          echo "Init failed, checking Android SDK setup..."
+          echo "ANDROID_HOME: $ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT: $ANDROID_SDK_ROOT"
+          ls -la /opt/android-sdk/ || echo "SDK not found"
+          which apksigner || echo "apksigner not found"
+          exit 1
+        }
+        
+        echo "=== Fdroid repository initialized successfully ==="
+
+    - name: Get version information from config
+      id: version_info
+      run: |
+        echo "=== Extracting version info from official config ==="
+        
+        # 检查配置文件是否存在 (注意目录名以连字符开头)
+        if [ ! -f "./-fdroiddata/metadata/us.spotco.fennec_dos.yml" ]; then
+          echo "ERROR: Official config file not found!"
+          echo "Looking for config files..."
+          find . -name "*.yml" | head -10
+          exit 1
+        fi
+        
+        CURRENT_VERSION=$(grep "CurrentVersion:" ./-fdroiddata/metadata/us.spotco.fennec_dos.yml | cut -d"'" -f2)
+        CURRENT_VERSION_CODE=$(grep "CurrentVersionCode:" ./-fdroiddata/metadata/us.spotco.fennec_dos.yml | awk '{print $2}')
+        
+        echo "Official current version: $CURRENT_VERSION"
+        echo "Official current version code: $CURRENT_VERSION_CODE"
+        echo "User requested version code: ${{ github.event.inputs.version_code }}"
+        
+        if [ "${{ github.event.inputs.version_code }}" = "auto" ]; then
+          VERSION_TO_BUILD="$CURRENT_VERSION_CODE"
+          echo "Using official version code: $VERSION_TO_BUILD"
+        else
+          VERSION_TO_BUILD="${{ github.event.inputs.version_code }}"
+          echo "Using user specified version code: $VERSION_TO_BUILD"
+        fi
+        
+        echo "version_to_build=$VERSION_TO_BUILD" >> $GITHUB_OUTPUT
+        echo "official_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+
+    - name: Prepare Mull build configuration
+      run: |
+        source fdroid-env/bin/activate
+        cd fdroid-build
+        
+        echo "=== Using official Mull configuration from repository ==="
+        cp ../-fdroiddata/metadata/us.spotco.fennec_dos.yml metadata/
+        
+        echo "=== Official Mull configuration content ==="
+        cat metadata/us.spotco.fennec_dos.yml
+        
+        echo "=== Checking for additional fdroiddata files ==="
+        find ../-fdroiddata/ -type f | head -20
+        
+        if [ -d "../-fdroiddata/" ]; then
+          echo "=== Copying all fdroiddata configuration ==="
+          # 只复制需要的文件，避免覆盖 fdroid 的配置
+          [ -d "../-fdroiddata/metadata" ] && cp -r ../-fdroiddata/metadata/* metadata/ 2>/dev/null || true
+          [ -d "../-fdroiddata/srclibs" ] && cp -r ../-fdroiddata/srclibs . 2>/dev/null || true
+          
+          echo "=== Copied fdroiddata structure ==="
+          find . -name "*spotco*" -o -name "*fennec*" -o -name "*mull*" | head -10
+        fi
+
+    - name: Build Mull APK
+      run: |
+        source fdroid-env/bin/activate
+        cd fdroid-build
+        
+        echo "=== Starting fdroid build process ==="
+        echo "Using official Mull 133.0.3 configuration"
+        echo "Version code to build: ${{ steps.version_info.outputs.version_to_build }}"
+        echo "Official version: ${{ steps.version_info.outputs.official_version }}"
+        echo "Architecture: ${{ github.event.inputs.architecture }}"
+        
+        fdroid build -v -l us.spotco.fennec_dos:${{ steps.version_info.outputs.version_to_build }} || {
+          echo "=== Build failed, checking logs ==="
+          find . -name "*.log" -newer metadata -exec echo "=== {} ===" \; -exec tail -100 {} \;
+          
+          echo "=== Checking tmp build directory ==="
+          find tmp -name "*mull*" -o -name "*fennec*" -o -name "*.apk" 2>/dev/null | head -10
+          
+          echo "=== Checking unsigned directory ==="
+          find unsigned -name "*.apk" 2>/dev/null | head -10
+          
+          echo "=== Complete directory structure ==="
+          find . -name "*.apk" -o -name "*.jar" 2>/dev/null
+          exit 1
+        }
+
+    - name: Find and prepare APKs
+      id: find_apk
+      run: |
+        cd fdroid-build
+        
+        echo "=== Searching for built APKs ==="
+        find . -name "*.apk" -type f
+        
+        APK_PATH=$(find . -name "*.apk" -type f | head -1)
+        if [ -z "$APK_PATH" ]; then
+          echo "No APK found!"
+          exit 1
+        fi
+        
+        echo "Found APK: $APK_PATH"
+        cp "$APK_PATH" ../mull-${{ github.event.inputs.architecture }}-$(date +%Y%m%d).apk
+        echo "apk_name=mull-${{ github.event.inputs.architecture }}-$(date +%Y%m%d).apk" >> $GITHUB_OUTPUT
+
+    - name: Check signing secrets
+      id: check_secrets
+      run: |
+        if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ] && [ -n "${{ secrets.KEYSTORE_PASSWORD }}" ] && [ -n "${{ secrets.KEY_PASSWORD }}" ] && [ -n "${{ secrets.KEY_ALIAS }}" ]; then
+          echo "signing_enabled=true" >> $GITHUB_OUTPUT
+        else
+          echo "signing_enabled=false" >> $GITHUB_OUTPUT
+          echo "Warning: Signing secrets not complete, will skip APK signing"
+        fi
+
+    - name: Decode signing keystore
+      if: steps.check_secrets.outputs.signing_enabled == 'true'
+      run: |
+        mkdir -p keystore
+        echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > keystore/keystore.jks
+
+    - name: Sign APK
+      if: steps.check_secrets.outputs.signing_enabled == 'true'
+      run: |
+        APK_NAME="${{ steps.find_apk.outputs.apk_name }}"
+        
+        sudo apt-get install -y android-sdk-build-tools
+        
+        zipalign -v 4 "$APK_NAME" "${APK_NAME%.apk}-aligned.apk"
+        
+        jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 \
+          -keystore keystore/keystore.jks \
+          -storepass "${{ secrets.KEYSTORE_PASSWORD }}" \
+          -keypass "${{ secrets.KEY_PASSWORD }}" \
+          "${APK_NAME%.apk}-aligned.apk" "${{ secrets.KEY_ALIAS }}"
+        
+        jarsigner -verify -verbose "${APK_NAME%.apk}-aligned.apk"
+        mv "${APK_NAME%.apk}-aligned.apk" "${APK_NAME%.apk}-signed.apk"
+
+    - name: Upload unsigned APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: mull-unsigned-${{ github.event.inputs.architecture }}
+        path: "*.apk"
+        retention-days: 30
+
+    - name: Upload signed APK
+      if: steps.check_secrets.outputs.signing_enabled == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: mull-signed-${{ github.event.inputs.architecture }}
+        path: "*-signed.apk"
+        retention-days: 90
+
+    - name: Build summary
+      run: |
+        echo "## Mull Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- Build method: fdroidserver (official method)" >> $GITHUB_STEP_SUMMARY
+        echo "- Version code to build: ${{ steps.version_info.outputs.version_to_build }}" >> $GITHUB_OUTPUT
+        echo "- Official version: ${{ steps.version_info.outputs.official_version }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Architecture: ${{ github.event.inputs.architecture }}" >> $GITHUB_STEP_SUMMARY
+        echo "- APK name: ${{ steps.find_apk.outputs.apk_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Architecture codes:" >> $GITHUB_STEP_SUMMARY
+        echo "- ARMv7: version code ending in 0" >> $GITHUB_STEP_SUMMARY
+        echo "- x86: version code ending in 1" >> $GITHUB_STEP_SUMMARY  
+        echo "- AArch64: version code ending in 2" >> $GITHUB_STEP_SUMMARY
+        ls -la *.apk >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "No APK files found" >> $GITHUB_STEP_SUMMARY
