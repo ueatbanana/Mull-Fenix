@@ -1,18 +1,27 @@
-name: Build Mull-Fenix Complete
+name: Build Mull using FDroidServer
 
 on:
   workflow_dispatch:
     inputs:
-      gecko_version:
-        description: 'Gecko ESR version (default: esr115)'
-        required: false
-        default: 'esr115'
+      version_code:
+        description: 'Version code to build (e.g., 2291052 for arm64)'
+        required: true
+        default: '2291052'
         type: string
+      architecture:
+        description: 'Target architecture'
+        required: false
+        default: 'arm64'
+        type: choice
+        options:
+        - arm64
+        - armv7
+        - x86
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 480  # 8小时超时，构建可能很长
+    timeout-minutes: 360  # 6小时超时
 
     steps:
     - name: Maximize build space
@@ -26,20 +35,17 @@ jobs:
 
     - name: Checkout Mull-Fenix
       uses: actions/checkout@v4
-      with:
-        path: mull-fenix
 
     - name: Setup build environment
       run: |
         sudo apt-get update
         sudo apt-get install -y \
-          curl wget unzip zip git \
-          clang cmake ninja-build pkg-config \
-          libgtk-3-dev libdbus-glib-1-dev libxt-dev libx11-dev \
-          autoconf2.13 python3 python-is-python3 \
-          build-essential libc6-dev \
-          yasm nasm nodejs npm \
-          mercurial
+          python3 python3-pip python3-venv \
+          git mercurial subversion \
+          openjdk-17-jdk-headless \
+          build-essential \
+          rsync \
+          unzip
 
     - name: Set up Java 17
       uses: actions/setup-java@v4
@@ -47,240 +53,124 @@ jobs:
         distribution: 'temurin'
         java-version: '17'
 
-    - name: Set up Rust
-      uses: actions-rust-lang/setup-rust-toolchain@v1
-      with:
-        toolchain: stable
-        target: aarch64-linux-android
-
-    - name: Install Android SDK and NDK
+    - name: Install fdroidserver
       run: |
-        # 下载并安装 Android SDK
-        wget -q https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip
-        unzip -q commandlinetools-linux-9477386_latest.zip
-        mkdir -p /opt/android-sdk/cmdline-tools
-        mv cmdline-tools /opt/android-sdk/cmdline-tools/latest
-        
-        export ANDROID_HOME=/opt/android-sdk
-        export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin
-        
-        # 安装必要的 SDK 组件
-        yes | sdkmanager --licenses || true
-        sdkmanager "platforms;android-33" "build-tools;33.0.2" "platforms;android-21"
-        
-        # 下载并安装 NDK r25c (与 ESR115 兼容)
-        wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
-        unzip -q android-ndk-r25c-linux.zip
-        mv android-ndk-r25c /opt/android-ndk
+        python3 -m venv fdroid-env
+        source fdroid-env/bin/activate
+        pip install fdroidserver
         
         # 验证安装
-        echo "=== Android SDK/NDK verification ==="
-        ls -la /opt/android-sdk/
-        ls -la /opt/android-ndk/
-        
-        # 设置环境变量
-        echo "ANDROID_HOME=/opt/android-sdk" >> $GITHUB_ENV
-        echo "ANDROID_SDK_ROOT=/opt/android-sdk" >> $GITHUB_ENV
-        echo "ANDROID_NDK_HOME=/opt/android-ndk" >> $GITHUB_ENV
-        echo "ANDROID_NDK_ROOT=/opt/android-ndk" >> $GITHUB_ENV
-        echo "/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-ndk" >> $GITHUB_PATH
+        fdroid --version
 
-    - name: Clone Gecko source
+    - name: Setup fdroid environment
       run: |
-        # 推荐版本说明：
-        # esr115: 最稳定，Mull 原始支持版本
-        # esr128: 较新但仍稳定，有安全更新
-        # latest: 最新版本，构建难度高，不推荐
+        source fdroid-env/bin/activate
         
-        git clone --depth 1 --branch ${{ github.event.inputs.gecko_version }} \
-          https://github.com/mozilla/gecko-dev.git gecko-dev
-        cd gecko-dev
-        echo "Using Firefox version: ${{ github.event.inputs.gecko_version }}"
-        git log -1 --oneline
+        # 创建 fdroid 工作目录
+        mkdir -p fdroid-build
+        cd fdroid-build
+        
+        echo "=== Initializing fdroid repository ==="
+        fdroid init --verbose
+        
+        echo "=== Cloning fdroiddata for Mull configs ==="
+        git clone https://gitlab.com/fdroid/fdroiddata.git
+        
+        # 查找 Mull 相关的配置文件
+        echo "=== Looking for Mull configuration ==="
+        find fdroiddata -name "*fennec*" -o -name "*mull*" -o -name "*spotco*" | head -10
 
-    - name: Apply Mull patches (if any)
+    - name: Prepare Mull build configuration
       run: |
-        cd gecko-dev
-        # 如果 mull-fenix 有补丁文件，应用它们
-        if [ -d "../mull-fenix/patches" ]; then
-          for patch in ../mull-fenix/patches/*.patch; do
-            if [ -f "$patch" ]; then
-              echo "Applying patch: $patch"
-              git apply "$patch" || echo "Patch $patch failed, continuing..."
-            fi
-          done
-        fi
-
-    - name: Create mozconfig
-      run: |
-        cd gecko-dev
+        source fdroid-env/bin/activate
+        cd fdroid-build
         
-        # 确保环境变量正确设置
-        export ANDROID_NDK_HOME=/opt/android-ndk
-        export ANDROID_SDK_ROOT=/opt/android-sdk
+        # 查找正确的应用 ID 和配置
+        echo "=== Searching for Mull app configuration ==="
+        find fdroiddata -name "*.yml" -exec grep -l "spotco\|fennec_dos\|Mull" {} \;
         
-        cat > mozconfig << 'EOF'
-        # 明确指定 Android 交叉编译
-        ac_add_options --target=aarch64-linux-android
-        ac_add_options --enable-application=mobile/android
-        
-        # Android 工具链路径（使用绝对路径）
-        ac_add_options --with-android-ndk=/opt/android-ndk
-        ac_add_options --with-android-sdk=/opt/android-sdk
-        
-        # Android 版本设置
-        ac_add_options --with-android-min-sdk=21
-        ac_add_options --with-android-max-sdk=33
-        
-        # 构建类型和优化
-        ac_add_options --enable-release
-        ac_add_options --disable-debug
-        ac_add_options --enable-optimize="-O2"
-        
-        # 禁用不需要的功能以简化构建
-        ac_add_options --disable-tests
-        ac_add_options --disable-necko-wifi
-        ac_add_options --disable-updater
-        ac_add_options --disable-crashreporter  
-        ac_add_options --disable-maintenance-service
-        ac_add_options --disable-webrtc
-        ac_add_options --disable-webspeech
-        ac_add_options --disable-synth-speechd
-        
-        # 链接器设置
-        ac_add_options --enable-linker=lld
-        
-        # 并发控制
-        mk_add_options MOZ_MAKE_FLAGS="-j2"
-        mk_add_options MOZ_PARALLEL_BUILD=2
-        
-        # 使用默认 branding（避免自定义 branding 问题）
-        ac_add_options --with-branding=mobile/android/branding/unofficial
-        
-        # 禁用官方 branding 检查
-        ac_add_options --disable-official-branding
-        EOF
-        
-        echo "=== Generated mozconfig ==="
-        cat mozconfig
-        
-        echo "=== Environment check ==="
-        echo "ANDROID_NDK_HOME: $ANDROID_NDK_HOME"
-        echo "ANDROID_SDK_ROOT: $ANDROID_SDK_ROOT"
-        ls -la /opt/android-ndk/toolchains/ || echo "NDK toolchains not found"
-
-    - name: Setup Mull branding
-      run: |
-        cd gecko-dev
-        # 创建 Mull branding 目录结构
-        mkdir -p mobile/android/branding/mull
-        
-        # 复制并修改品牌文件（如果 mull-fenix 提供了的话）
-        if [ -d "../mull-fenix/branding" ]; then
-          cp -r ../mull-fenix/branding/* mobile/android/branding/mull/
+        # 复制 Mull 配置到 fdroid metadata
+        MULL_CONFIG=$(find fdroiddata -name "*.yml" -exec grep -l "us.spotco.fennec_dos\|Mull" {} \; | head -1)
+        if [ -n "$MULL_CONFIG" ]; then
+          echo "Found Mull config: $MULL_CONFIG"
+          cp "$MULL_CONFIG" metadata/
+          
+          # 显示配置内容
+          echo "=== Mull build configuration ==="
+          cat "$MULL_CONFIG"
         else
-          # 使用默认的 Firefox branding 作为基础
-          cp -r mobile/android/branding/unofficial/* mobile/android/branding/mull/
-          # 修改应用名称
-          sed -i 's/Fennec/Mull/g' mobile/android/branding/mull/configure.sh
+          echo "Mull config not found in fdroiddata, creating basic config..."
+          
+          # 创建基本的 Mull 配置
+          cat > metadata/us.spotco.fennec_dos.yml << 'EOF'
+Categories:
+  - Internet
+License: MPL-2.0
+AuthorName: Divested Computing Group
+AuthorWebSite: https://divestos.org
+WebSite: https://divestos.org/pages/our_apps#mull
+SourceCode: https://codeberg.org/divested-mobile/mull-fenix
+IssueTracker: https://codeberg.org/divested-mobile/mull-fenix/issues
+
+AutoName: Mull
+Summary: Privacy oriented web browser
+Description: |-
+    Privacy oriented web browser based on Firefox. Removes proprietary blobs and enables many features from Tor Uplift project.
+
+RepoType: git
+Repo: https://codeberg.org/divested-mobile/mull-fenix.git
+
+Builds:
+  - versionName: '129.0'
+    versionCode: ${{ github.event.inputs.version_code }}
+    commit: HEAD
+    timeout: 21600
+    sudo:
+      - apt-get update
+      - apt-get install -y mercurial
+    gradle:
+      - yes
+    prebuild: |
+      # Mull specific prebuild steps would go here
+    build: |
+      # Custom build script for Mull
+      echo "Building Mull with fdroidserver"
+
+AutoUpdateMode: None
+UpdateCheckMode: None
+CurrentVersion: '129.0'
+CurrentVersionCode: ${{ github.event.inputs.version_code }}
+EOF
         fi
 
-    - name: Bootstrap build environment
+    - name: Build Mull APK
       run: |
-        cd gecko-dev
-        export MOZBUILD_STATE_PATH=$HOME/.mozbuild
+        source fdroid-env/bin/activate
+        cd fdroid-build
         
-        # 检查 mach bootstrap 支持的参数
-        echo "Checking mach bootstrap options..."
-        python3 ./mach bootstrap --help || true
+        echo "=== Starting fdroid build process ==="
+        echo "Version code: ${{ github.event.inputs.version_code }}"
+        echo "Architecture: ${{ github.event.inputs.architecture }}"
         
-        # 尝试不同的 bootstrap 方式
-        echo "Starting bootstrap process..."
-        
-        # 方法1：尝试使用 --application-choice
-        if python3 ./mach bootstrap --application-choice=mobile_android 2>/dev/null; then
-          echo "Bootstrap successful with --application-choice"
-        else
-          echo "Method 1 failed, trying alternative..."
+        # 构建 Mull
+        fdroid build -v -l us.spotco.fennec_dos:${{ github.event.inputs.version_code }} || {
+          echo "=== Build failed, checking logs ==="
+          find . -name "*.log" -newer metadata -exec echo "=== {} ===" \; -exec tail -100 {} \;
           
-          # 方法2：使用 yes 命令自动回答交互提示
-          echo "2" | python3 ./mach bootstrap || {
-            echo "Method 2 failed, trying manual setup..."
-            
-            # 方法3：手动安装必要的依赖
-            python3 ./mach artifact toolchain --from-build linux64-rust
-            python3 ./mach artifact toolchain --from-build linux64-cbindgen
-            python3 ./mach artifact toolchain --from-build linux64-nasm
-            python3 ./mach artifact toolchain --from-build linux64-node
-          }
-        fi
+          echo "=== Checking build directory ==="
+          find . -name "*mull*" -o -name "*fennec*" -o -name "*.apk"
+          exit 1
+        }
 
-    - name: Build APK
-      run: |
-        cd gecko-dev
-        export MOZBUILD_STATE_PATH=$HOME/.mozbuild
-        export MOZCONFIG=$PWD/mozconfig
-        export ANDROID_NDK_HOME=/opt/android-ndk
-        export ANDROID_SDK_ROOT=/opt/android-sdk
-        export ANDROID_HOME=/opt/android-sdk
-        
-        echo "=== Environment Setup ==="
-        echo "MOZCONFIG: $MOZCONFIG"
-        echo "ANDROID_NDK_HOME: $ANDROID_NDK_HOME"
-        echo "ANDROID_SDK_ROOT: $ANDROID_SDK_ROOT"
-        
-        echo "=== Verifying Android toolchain ==="
-        if [ ! -d "/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64" ]; then
-          echo "ERROR: Android NDK toolchain not found!"
-          ls -la /opt/android-ndk/
-          exit 1
-        fi
-        
-        echo "=== Configure step ==="
-        ./mach configure --verbose || {
-          echo "=== Configure failed, showing logs ==="
-          if [ -f "config.log" ]; then
-            echo "--- config.log (last 100 lines) ---"
-            tail -100 config.log
-          fi
-          if [ -f "obj-*/config.log" ]; then
-            echo "--- obj-*/config.log (last 100 lines) ---"
-            tail -100 obj-*/config.log
-          fi
-          echo "=== Checking for configure errors ==="
-          find . -name "*.log" -exec grep -l "configure.*error\|configure.*failed" {} \;
-          exit 1
-        }
-        
-        echo "=== Configuration successful, starting build ==="
-        ./mach build -v || {
-          echo "=== Build failed, diagnostic information ==="
-          echo "--- Recent build logs ---"
-          find . -name "*.log" -newer mozconfig -exec echo "=== {} ===" \; -exec tail -50 {} \; 2>/dev/null | head -200
-          
-          echo "--- Checking for specific errors ---"
-          find . -name "*.log" -exec grep -H -A5 -B5 "error\|Error\|ERROR\|failed\|FAILED" {} \; 2>/dev/null | head -100
-          
-          echo "--- Build directory structure ---"
-          find obj-* -maxdepth 2 -type d 2>/dev/null | head -20
-          exit 1
-        }
-        
-        echo "=== Build successful, creating package ==="
-        ./mach package || {
-          echo "=== Package failed ==="
-          find obj-* -name "*.apk" -o -name "*.so" -o -name "*.jar" 2>/dev/null | head -10
-          exit 1
-        }
-        
-        echo "=== Build completed successfully ==="
-        find obj-* -name "*.apk" -ls
-
-    - name: Find and prepare APK
+    - name: Find and prepare APKs
       id: find_apk
       run: |
-        cd gecko-dev
-        APK_PATH=$(find obj-* -name "*.apk" -type f | head -n1)
+        cd fdroid-build
+        
+        echo "=== Searching for built APKs ==="
+        find . -name "*.apk" -type f
+        
+        APK_PATH=$(find . -name "*.apk" -type f | head -1)
         if [ -z "$APK_PATH" ]; then
           echo "No APK found!"
           exit 1
@@ -288,9 +178,9 @@ jobs:
         
         echo "Found APK: $APK_PATH"
         
-        # 复制到工作目录并重命名
-        cp "$APK_PATH" ../mull-fenix-arm64-$(date +%Y%m%d).apk
-        echo "apk_name=mull-fenix-arm64-$(date +%Y%m%d).apk" >> $GITHUB_OUTPUT
+        # 复制 APK 到工作目录
+        cp "$APK_PATH" ../mull-${{ github.event.inputs.architecture }}-$(date +%Y%m%d).apk
+        echo "apk_name=mull-${{ github.event.inputs.architecture }}-$(date +%Y%m%d).apk" >> $GITHUB_OUTPUT
 
     - name: Check signing secrets
       id: check_secrets
@@ -313,8 +203,11 @@ jobs:
       run: |
         APK_NAME="${{ steps.find_apk.outputs.apk_name }}"
         
+        # 安装 Android SDK build tools (for zipalign)
+        sudo apt-get install -y android-sdk-build-tools
+        
         # 对齐APK
-        /opt/android-sdk/build-tools/33.0.2/zipalign -v 4 "$APK_NAME" "${APK_NAME%.apk}-aligned.apk"
+        zipalign -v 4 "$APK_NAME" "${APK_NAME%.apk}-aligned.apk"
         
         # 签名APK
         jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 \
@@ -323,7 +216,7 @@ jobs:
           -keypass "${{ secrets.KEY_PASSWORD }}" \
           "${APK_NAME%.apk}-aligned.apk" "${{ secrets.KEY_ALIAS }}"
         
-        # 最终签名验证
+        # 验证签名
         jarsigner -verify -verbose "${APK_NAME%.apk}-aligned.apk"
         
         mv "${APK_NAME%.apk}-aligned.apk" "${APK_NAME%.apk}-signed.apk"
@@ -331,7 +224,7 @@ jobs:
     - name: Upload unsigned APK
       uses: actions/upload-artifact@v4
       with:
-        name: mull-fenix-unsigned-apk
+        name: mull-unsigned-${{ github.event.inputs.architecture }}
         path: "*.apk"
         retention-days: 30
 
@@ -339,14 +232,20 @@ jobs:
       if: steps.check_secrets.outputs.signing_enabled == 'true'
       uses: actions/upload-artifact@v4
       with:
-        name: mull-fenix-signed-apk
+        name: mull-signed-${{ github.event.inputs.architecture }}
         path: "*-signed.apk"
         retention-days: 90
 
     - name: Build summary
       run: |
-        echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
-        echo "- Gecko version: ${{ github.event.inputs.gecko_version }}" >> $GITHUB_STEP_SUMMARY
-        echo "- Target: arm64-v8a" >> $GITHUB_STEP_SUMMARY
+        echo "## Mull Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- Build method: fdroidserver (official method)" >> $GITHUB_STEP_SUMMARY
+        echo "- Version code: ${{ github.event.inputs.version_code }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Architecture: ${{ github.event.inputs.architecture }}" >> $GITHUB_STEP_SUMMARY
         echo "- APK name: ${{ steps.find_apk.outputs.apk_name }}" >> $GITHUB_STEP_SUMMARY
-        ls -la *.apk >> $GITHUB_STEP_SUMMARY || echo "No APK files found" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Architecture codes:" >> $GITHUB_STEP_SUMMARY
+        echo "- ARMv7: version code ending in 0" >> $GITHUB_STEP_SUMMARY
+        echo "- x86: version code ending in 1" >> $GITHUB_STEP_SUMMARY  
+        echo "- AArch64: version code ending in 2" >> $GITHUB_STEP_SUMMARY
+        ls -la *.apk >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "No APK files found" >> $GITHUB_STEP_SUMMARY
